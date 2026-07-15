@@ -4,7 +4,7 @@ description: |
   飞书智能会议纪要。发送妙记链接自动生成结构化纪要文档。
   产出：SVG富卡片速览画板、核心结论、议题章节、决议、待办。
   触发：飞书妙记、会议纪要、智能纪要、妙记链接、feishu.cn/minutes/
-version: "3.0.0"
+version: "3.1.0"
 ---
 
 # 飞书智能纪要
@@ -16,7 +16,7 @@ version: "3.0.0"
 ```
 1. 会议信息头部（blockquote：主题、时间、参会人 @cite）
 2. 核心结论（3-5条，callout 高亮 ol）
-3. 📊 会议速览（SVG 画板 — 富卡片式议题总览）
+3. 📊 会议速览（SVG 画板 — 富卡片式议题总览；短会可降级为 callout 列表）
 4. 正文（按议题分组，每议题一章）
 5. ✅ 待办事项（checkbox 列表）
 6. 🔗 原妙记链接（url-preview）
@@ -25,34 +25,34 @@ version: "3.0.0"
 ## 核心原则
 
 1. **独立分析**：基于逐字稿提炼，不搬运 AI 总结
-2. **SVG 画板**：速览图用 `<whiteboard type="svg">` 富卡片，不用 Mermaid mindmap
+2. **SVG 画板**：速览图用 `<whiteboard type="svg">` 富卡片，不用 Mermaid mindmap；≤2 议题或 <15 分钟的短会可降级为 callout 列表
 3. **富 block**：callout/grid/checkbox/table/whiteboard 替代纯文本
 4. **信息密度**：连续纯文本 ≤3段，富 block 密度 ≥40%，元素类型 ≥3种
 5. **简洁去 AI**：精准可执行，不堆黑话
 
-## 工作流（4步）
+## 工作流
 
-### Step 1：提取数据
+### Step 0：前置检查
 
-从妙记链接提取 `minute_token`（正则 `/minutes/([a-zA-Z0-9]+)`），并行拉取：
-
+1. 从妙记链接提取 `minute_token`（正则 `/minutes/([a-zA-Z0-9]+)`）
+2. 拉取妙记数据：
 ```bash
 lark-cli vc +notes --minute-tokens "<minute_token>" --format json
+```
+3. 如果返回的 artifacts 为空或 transcript_file 不存在 → 妙记可能仍在转写中，告知用户等待转写完成后再试
+4. 如果有 meeting_id（非必须），可额外拉取会议元信息丰富参会人数据：
+```bash
 lark-cli vc +search --meeting-ids "<meeting_id>" --format json
 ```
 
-产物选择：
-- 内容总结 → transcript（逐字稿），不用 AI summary
+**产物优先级**：
+- 内容总结 → **逐字稿（transcript）**，AI summary 仅辅助参考
+- 逐字稿优先读取 `vc +notes` 已保存的本地文件 `minutes/<minute_token>/transcript.txt`
 - 待办 → 参考 AI todo + transcript 补充
 - 章节 → 参考 AI chapter + transcript 细化
-- 元信息 → vc meeting 数据
+- 元信息 → vc meeting 数据（如有）
 
-拉取逐字稿：
-```bash
-lark-cli docs +fetch --api-version v2 --doc "<verbatim_doc_token>" --doc-format markdown
-```
-
-### Step 2：分析
+### Step 1：分析
 
 基于逐字稿独立提炼：
 
@@ -64,27 +64,41 @@ lark-cli docs +fetch --api-version v2 --doc "<verbatim_doc_token>" --doc-format 
 
 **待办事项**：任务 + @负责人 + 截止时间。逐字稿未明确负责人的标注"待确认"，不猜测。按优先级排序。
 
-### Step 3：创建文档骨架
+### Step 2：生成纪要文档
+
+**推荐方式：overwrite 全文写入（一步到位）**
+
+先创建空文档，再用 `overwrite` 一次性写入完整内容：
 
 ```bash
-lark-cli docs +create --api-version v2 --content @skeleton.xml
+# 创建空文档
+lark-cli docs +create --api-version v2 --content @skeleton.xml --as user
+# 拿到 document_id 后，直接 overwrite 完整纪要
+lark-cli docs +update --api-version v2 --doc "<doc_id>" --command overwrite --content @full_minutes.xml --as user
 ```
 
-`skeleton.xml` 模板见 `references/layout-templates.md` 第 1 节。
+**备选方式：block_insert_after 逐章写入**
 
-骨架包含：标题、会议信息 blockquote、免责声明、核心结论占位、📊 会议速览 heading（等 SVG 插入）、各议题 h2 标题、待办占位、妙记链接。
+如需逐章替换，先用 `docs content get` 获取所有 block_id：
+```bash
+lark-cli docs content get --api-version v2 --doc "<doc_id>" --as user
+```
+然后定位各占位 block 的 ID，用 `block_insert_after` 替换。
 
-保存返回的 `document_id` 和各 block 的 `block_id`（关键：速览 heading block_id 用于后续 SVG 插入）。
+文档骨架模板和章节模板见 `references/layout-templates.md`。
 
-### Step 4：精修 + 画板
+`skeleton.xml` 中 `--parent-position` 参数省略则默认存入我的空间，用户可自行移动。
 
-用 `docs +update` 的 `block_insert_after` 分章节写入。
+### Step 3：插入速览画板
 
-**4a. 填充核心结论**
+速览图使用 `<whiteboard type="svg">` 富卡片。
 
-找到核心结论占位 block，`block_insert_after` 写入 callout + ol。
-
-**4b. 插入速览画板（必选，在 📊 会议速览 heading 之后）**
+**根据议题数量选择布局**：
+| 议题数 | 布局 | 详见 |
+|--------|------|------|
+| 3-5 个 | 横排卡片 + 底部待办 | `references/whiteboard-design.md` |
+| 1-2 个 | 双栏卡片或单卡 | 简化模板 |
+| 短会（<15分钟） | 省略画板，改用 callout 列表 | `references/layout-templates.md` 第 6 节 |
 
 ```bash
 lark-cli docs +update --api-version v2 --doc "<doc_id>" \
@@ -93,37 +107,12 @@ lark-cli docs +update --api-version v2 --doc "<doc_id>" \
   --content '<whiteboard type="svg">...完整 SVG...</whiteboard>'
 ```
 
-SVG 画板按议题数自适应布局，详细模板和色板见 `references/whiteboard-design.md`。
+**SVG 注意事项**：
+- `<text>` 不支持自动换行，长文本需用多个 `<tspan>` 分行
+- 不同议题用不同底色区分（色板见 whiteboard-design.md）
+- SVG 画板创建后不可修改，需确保内容正确再提交
 
-**4c. 按章节写入正文**
-
-每章模式（决议融入各章节）：
-```xml
-<callout emoji="🎯" background-color="light-blue">
-  <p><b>本章要点：</b>{一句话概括}</p>
-</callout>
-
-<grid>
-  <column width-ratio="0.5">
-    <h3>讨论内容</h3>
-    <ul><li>...</li></ul>
-  </column>
-  <column width-ratio="0.5">
-    <h3>决议与下一步</h3>
-    <ul><li>...</li></ul>
-  </column>
-</grid>
-```
-
-**4d. 待办事项**
-
-```xml
-<checkbox done="false">{任务描述} — @{负责人} ⏰ {截止日期}</checkbox>
-```
-
-用 `lark-contact` 解析 user-id 写 `<cite type="user">`，无则用纯文本 @姓名。
-
-**4e. 章节内画板（按需）**
+### Step 4：章节内画板（按需）
 
 | 内容特征 | 画板类型 |
 |---------|---------|
@@ -171,7 +160,7 @@ SVG 画板按议题数自适应布局，详细模板和色板见 `references/whi
 | 章节丰富度 | 每个 h2 ≥1 个非纯文本 block |
 | 开头 callout | 必须有（核心结论） |
 | 章节分隔 | 不同议题间有 `<hr/>` |
-| 画板存在 | 至少 1 个 `<whiteboard>` |
+| 画板存在 | 至少 1 个 `<whiteboard>`（短会可豁免） |
 
 ## 关键约束
 
@@ -183,10 +172,20 @@ SVG 画板按议题数自适应布局，详细模板和色板见 `references/whi
 6. 决议融入各议题章节，不再设独立「决议记录」章节
 7. 直接输出文档链接，不额外说明
 
+## 异常处理
+
+| 异常情况 | 处理方式 |
+|---------|---------|
+| 妙记仍在转写中（无 artifacts/transcript） | 告知用户等待转写完成，1-2 分钟后重试 |
+| 逐字稿为空或 < 1 分钟 | 提示用户该妙记可能录制失败或内容过短 |
+| `lark-contact` 查询用户失败 | 降级为纯文本 @姓名，不加 `<cite>` |
+| API 返回权限错误 | 提示用户检查妙记分享权限或重新授权 |
+| 逐字稿 > 60 分钟 | 按 chapter 分段分析后拼接结论 |
+
 ## 参考文件
 
-- `references/layout-templates.md` — 骨架 XML + 章节模板 + 待办模板
+- `references/layout-templates.md` — 骨架 XML + 章节模板 + 待办模板 + 会议类型变体
 - `references/whiteboard-design.md` — SVG 画板模板与色板
-- `references/phone-setup.md` — 手机物理按键配置指南
+- `references/phone-setup.md` — 📱 附录：手机一键启动妙记录音（iPhone/Android 配置指南）
 - `lark-shared/SKILL.md` — 认证
 - `lark-vc/references/vc-domain-boundaries.md` — 产物选择
